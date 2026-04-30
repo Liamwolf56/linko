@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
+	pkgerr "github.com/pkg/errors"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -15,8 +15,6 @@ const UserContextKey contextKey = "user"
 var allowedUsers = map[string]string{
 	"frodo":   "$2a$10$B6O/n6teuCzpuh66jrUAdeaJ3WvXcxRkzpN0x7H.di9G9e/NGb9Me",
 	"samwise": "$2a$10$EWZpvYhUJtJcEMmm/IBOsOGIcpxUnGIVMRiDlN/nxl1RRwWGkJtty",
-	// frodo: "ofTheNineFingers"
-	// samwise: "theStrong"
 	"saruman": "invalidFormat",
 }
 
@@ -34,7 +32,9 @@ func (s *server) authMiddleware(next http.Handler) http.Handler {
 		}
 		ok, err := s.validatePassword(password, stored)
 		if err != nil {
-			fmt.Printf("error validating password for user: %s, error: %v\n", username, err)
+			// This logs the error including the stack trace 
+			// (because the logger's ReplaceAttr handles the %+v formatting)
+			s.logger.Error("error validating password", "user", username, "error", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
@@ -53,8 +53,8 @@ func (s *server) validatePassword(password, stored string) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		fmt.Printf("error validating password: %v\n", err)
-		return false, err
+		// This wraps the error with the stack trace
+		return false, pkgerr.WithStack(err)
 	}
 	return true, nil
 }
