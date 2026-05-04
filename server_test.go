@@ -5,8 +5,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"boot.dev/linko/internal/middleware"
 )
 
 func Test_requestLogger(t *testing.T) {
@@ -22,29 +25,41 @@ func Test_requestLogger(t *testing.T) {
 		},
 	}))
 
-	// Create a minimal server instance to access the method
+	// Create a minimal server instance
 	s := &server{logger: logger}
-	
+
 	// Create a dummy handler to pass through the middleware
 	dummyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
-	
+
 	// Apply the middleware
-	loggedHandler := s.requestLogger(dummyHandler)
+	loggedHandler := middleware.RequestLogger(s.logger)(dummyHandler)
 
 	req := httptest.NewRequest("GET", "http://lin.ko/api/stats", nil)
+	// Set a consistent IP for testing
+	req.RemoteAddr = "192.0.2.x:1234"
+	
 	rr := httptest.NewRecorder()
 	loggedHandler.ServeHTTP(rr, req)
 
-	const expectedLogString = `time=2023-10-01T12:34:57.000Z level=INFO msg="Served request" method=GET path=/api/stats client_ip=192.0.2.1:1234` + "\n"
-	const expectedStatusCode = http.StatusOK
+	logOutput := logBuffer.String()
 
-	// Check the log output
-	if logBuffer.String() != expectedLogString {
-		t.Errorf("expected log: %q, got: %q", expectedLogString, logBuffer.String())
+	// Check for essential components instead of an exact string match.
+	// This prevents the test from failing due to dynamic 'duration' values.
+	expectedParts := []string{
+		`msg="Served request"`,
+		`method=GET`,
+		`path=/api/stats`,
+		`response_status=200`,
+	}
+
+	for _, part := range expectedParts {
+		if !strings.Contains(logOutput, part) {
+			t.Errorf("log missing expected part %q. Got: %q", part, logOutput)
+		}
 	}
 
 	// Check the status code
-	if rr.Code != expectedStatusCode {
-		t.Errorf("expected status code: %d, got: %d", expectedStatusCode, rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status code: %d, got: %d", http.StatusOK, rr.Code)
 	}
 }

@@ -1,139 +1,134 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
-	"os/signal"
-	"syscall"
+	"slices"
 	"time"
 
+	"boot.dev/linko/internal/build"
+	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
-	pkgerr "github.com/pkg/errors"
+
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// stackTracer is the interface to extract stack traces from pkg/errors
-type stackTracer interface {
+type multiError interface {
 	error
-	StackTrace() pkgerr.StackTrace
+	Unwrap() []error
 }
 
-// AsType is a generic helper to check if an error implements an interface
-func AsType[T any](err error) (T, bool) {
-	var target T
-	if errors.As(err, &target) {
-		return target, true
+type stackTracer interface {
+	StackTrace() []uintptr
+}
+
+func errorAttrs(err error) []slog.Attr {
+	attrs := []slog.Attr{slog.String("msg", err.Error())}
+	attrs = append(attrs, linkoerr.Attrs(err)...)
+	var st stackTracer
+	if errors.As(err, &st) {
+		attrs = append(attrs, slog.Any("stack_trace", st.StackTrace()))
 	}
-	return target, false
+	return attrs
 }
 
-// replaceAttr groups the error into a structured object with message and stack_trace
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	sensitiveKeys := []string{"password", "key", "apikey", "secret", "pin", "creditcardno", "user"}
+	if slices.Contains(sensitiveKeys, a.Key) {
+		return slog.String(a.Key, "[REDACTED]")
+	}
+
+	if a.Value.Kind() == slog.KindString {
+		u, err := url.Parse(a.Value.String())
+		if err == nil && u.User != nil {
+			if _, hasPass := u.User.Password(); hasPass {
+				newURL := *u
+				newURL.User = url.UserPassword(u.User.Username(), "[REDACTED]")
+				return slog.String(a.Key, newURL.String())
+			}
+		}
+	}
+
 	if a.Key == "error" {
-		err, ok := a.Value.Any().(error)
-		if !ok {
-			return a
+		if err, ok := a.Value.Any().(error); ok {
+			var me multiError
+			if errors.As(err, &me) {
+				errs := me.Unwrap()
+				errGroupArgs := make([]any, len(errs))
+				for i, e := range errs {
+					attrs := errorAttrs(e)
+					args := make([]any, len(attrs))
+					for j, attr := range attrs {
+						args[j] = attr
+					}
+					errGroupArgs[i] = slog.Group(fmt.Sprintf("error_%d", i+1), args...)
+				}
+				return slog.Group("errors", errGroupArgs...)
+			}
+			attrs := errorAttrs(err)
+			args := make([]any, len(attrs))
+			for i, attr := range attrs {
+				args[i] = attr
+			}
+			return slog.Group("error", args...)
 		}
-
-		// If it's a stackTracer, output structured object with message and stack_trace
-		if stackErr, ok := AsType[stackTracer](err); ok {
-			return slog.GroupAttrs("error",
-				slog.String("message", stackErr.Error()),
-				slog.String("stack_trace", fmt.Sprintf("%+v", stackErr.StackTrace())),
-			)
-		}
-
-		// Fallback for normal errors
-		return slog.GroupAttrs("error",
-			slog.String("message", err.Error()),
-		)
 	}
 	return a
 }
 
-type closeFunc func() error
-
-func initializeLogger() (*slog.Logger, closeFunc) {
-	logFile := os.Getenv("LINKO_LOG_FILE")
-
-	// Stderr: DEBUG and above (Human readable)
-	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level:       slog.LevelDebug,
-		ReplaceAttr: replaceAttr,
-	})
-
-	if logFile == "" {
-		return slog.New(stderrHandler), func() error { return nil }
-	}
-
-	file, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
-		os.Exit(1)
-	}
-
-	bufferedFile := bufio.NewWriterSize(file, 8192)
-
-	// File: INFO and above (Machine readable JSON)
-	fileHandler := slog.NewJSONHandler(bufferedFile, &slog.HandlerOptions{
-		Level:       slog.LevelInfo,
-		ReplaceAttr: replaceAttr,
-	})
-
-	// Combine handlers
-	logger := slog.New(slog.NewMultiHandler(stderrHandler, fileHandler))
-
-	cleanup := func() error {
-		if err := bufferedFile.Flush(); err != nil {
-			return err
-		}
-		return file.Close()
-	}
-
-	return logger, cleanup
-}
-
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	var handler slog.Handler
+	var logWriter io.WriteCloser
 
-	httpPort := flag.Int("port", 8899, "port to listen on")
-	dataDir := flag.String("data", "./data", "directory to store data")
-	flag.Parse()
-
-	logger, cleanup := initializeLogger()
-	defer func() {
-		if err := cleanup(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to cleanup logger: %v\n", err)
+	if logFile := os.Getenv("LINKO_LOG_FILE"); logFile != "" {
+		lumber := &lumberjack.Logger{
+			Filename: logFile, MaxSize: 1, MaxBackups: 10, MaxAge: 28, LocalTime: false, Compress: true,
 		}
-	}()
-
-	st, err := store.New(*dataDir, logger)
-	if err != nil {
-		logger.Error("failed to create store", "error", err)
-		os.Exit(1)
+		logWriter = lumber
+		handler = slog.NewJSONHandler(logWriter, &slog.HandlerOptions{ReplaceAttr: replaceAttr})
+	} else {
+		isTTY := isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())
+		handler = tint.NewHandler(os.Stderr, &tint.Options{NoColor: !isTTY, ReplaceAttr: replaceAttr})
 	}
 
-	s := newServer(*st, *httpPort, cancel, logger)
+	logger := slog.New(handler)
+	if logWriter != nil {
+		defer logWriter.Close()
+	}
 
-	var serverErr error
-	go func() {
-		serverErr = s.start()
-	}()
+	env := os.Getenv("ENV")
+	hostname, _ := os.Hostname()
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", env),
+		slog.String("hostname", hostname),
+	)
 
-	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	slog.SetDefault(logger)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := s.shutdown(shutdownCtx); err != nil {
-		logger.Error("failed to shutdown server", "error", err)
-		os.Exit(1)
-	}
-	if serverErr != nil {
-		logger.Error("server error", "error", serverErr)
+	myStore := store.NewStore("data")
+	srv := newServer(myStore, 8899, cancel, logger)
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		srv.shutdown(shutdownCtx)
+	}()
+
+	slog.Info("Starting Linko server on :8899")
+	if err := srv.start(); err != nil {
+		slog.Error("Server failed", "error", err)
 		os.Exit(1)
 	}
 }

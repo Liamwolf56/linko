@@ -2,61 +2,108 @@ package store
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"math/rand"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
+
+	"boot.dev/linko/internal/linkoerr"
 )
 
 type Store struct {
-	dir    string
-	logger *slog.Logger
+	dir   string
+	cache map[string]string
+	mu    sync.RWMutex
 }
 
-func New(dir string, logger *slog.Logger) (*Store, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
-	}
+func NewStore(dir string) *Store {
 	return &Store{
-		dir:    dir,
-		logger: logger,
-	}, nil
+		dir:   dir,
+		cache: make(map[string]string),
+	}
 }
 
-// Lookup matches the expected signature in handlers.go
-func (s *Store) Lookup(ctx context.Context, short string) (string, error) {
-	path := filepath.Join(s.dir, short)
+func (s *Store) Create(ctx context.Context, longURL string) (string, error) {
+	b := make([]byte, 3)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	code := hex.EncodeToString(b)
+	path := filepath.Join(s.dir, code)
+	err = os.WriteFile(path, []byte(longURL), 0644)
+	if err != nil {
+		return "", err
+	}
+	return code, nil
+}
+
+func (s *Store) List(ctx context.Context) (map[string]string, error) {
+	urls := make(map[string]string)
+	var errs []error
+
+	err := s.walk(func(entry fs.DirEntry) error {
+		if entry.IsDir() {
+			return nil
+		}
+
+		path := filepath.Join(s.dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			err = linkoerr.WithAttrs(err, "path", path)
+			errs = append(errs, err)
+			return nil
+		}
+		urls[entry.Name()] = string(data)
+		return nil
+	})
+
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return urls, errors.Join(errs...)
+	}
+
+	return urls, nil
+}
+
+func (s *Store) Lookup(ctx context.Context, code string) (string, error) {
+	s.mu.RLock()
+	if val, ok := s.cache[code]; ok {
+		s.mu.RUnlock()
+		return val, nil
+	}
+	s.mu.RUnlock()
+
+	path := filepath.Join(s.dir, code)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// Wrapped error: the handler will log this once
-		return "", fmt.Errorf("read %s: %w", path, err)
+		return "", err
 	}
-	return string(data), nil
+
+	result := string(data)
+
+	s.mu.Lock()
+	s.cache[code] = result
+	s.mu.Unlock()
+
+	return result, nil
 }
 
-// Create matches the expected signature in handlers.go
-func (s *Store) Create(ctx context.Context, url string) (string, error) {
-	short := fmt.Sprintf("%d", rand.Intn(100000))
-	path := filepath.Join(s.dir, short)
-	
-	if err := os.WriteFile(path, []byte(url), 0644); err != nil {
-		return "", fmt.Errorf("write %s: %w", path, err)
-	}
-	return short, nil
-}
-
-// List matches the expected signature in handlers.go
-func (s *Store) List(ctx context.Context) ([]string, error) {
+func (s *Store) walk(fn func(entry fs.DirEntry) error) error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
-		return nil, fmt.Errorf("read dir %s: %w", s.dir, err)
+		return err
 	}
-	var files []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			files = append(files, entry.Name())
+	for _, e := range entries {
+		if err := fn(e); err != nil {
+			return linkoerr.WithAttrs(err, "path", filepath.Join(s.dir, e.Name()))
 		}
 	}
-	return files, nil
+	return nil
 }
